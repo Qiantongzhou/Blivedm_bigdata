@@ -1,9 +1,13 @@
 # -*- coding: utf-8 -*-
 import asyncio
+import hashlib
 import logging
+import time
+import urllib
 from typing import *
 
 import aiohttp
+import requests
 import yarl
 
 from . import ws_base
@@ -198,16 +202,60 @@ class BLiveClient(ws_base.WebSocketClientBase):
         self._room_id = room_info['room_id']
         self._room_owner_uid = room_info['uid']
         return True
+    def initnet(self):
+        UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
+        self.sess = requests.Session()
+        self.sess.headers.update({
+            "User-Agent": UA,
+            "Referer": f"https://live.bilibili.com/{self._room_id}",
+            "Origin": "https://live.bilibili.com",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+        })
+        self.sess.cookies.update({
+            "SESSDATA": "285001da%2C1763687156%2C01e7d%2A52CjBASyqqlqZITZbpuLnIBCcXDRjcX0rEZu2HjI8sGtIJDtAtn9V5xhyxKyJWl4JlARkSVmNBNDhLdmVndzRYVUVVMk9RdURTTmdmMGRfX2VvM0xHbUd3SF94c3lYRHd2N1RINHJJV0pKWDNlbTU3UnlCeVlfcHZadHlrbkJMNlNtTFdzWng1bktBIIEC",
+            "buvid4": "D4B96D9A-26B5-1B88-0DEA-51223B5ACB6380933-024120719-bFB3sYmyJ%2B9x0yWCD1L9Aw%3D%3D",
+            "b_nut": "1733601279",
+            "bili_jct": "1c6606206e98f82710d0bf9658d650f8",
+            "DedeUserID": "154107998",
+            "DedeUserID__ckMd5": "702776d4425d894a",
+            "bili_ticket": "eyJhbGciOiJIUzI1NiIsImtpZCI6InMwMyIsInR5cCI6IkpXVCJ9.eyJleHAiOjE3NDg0OTAxNDAsImlhdCI6MTc0ODIzMDg4MCwicGx0IjotMX0.WaWBz6Ezu2h0i6QLih00eOBcGWqyW-bLupd1a-z_zjQ",
+            "fingerprint": "2a33c1575c214701539e933c95b983a4",
+        })
+    def get_img_sub_key(self):
+        self.initnet()
+        """每天只用请求一次 nav 接口即可"""
+        nav = self.sess.get("https://api.bilibili.com/x/web-interface/nav",
+                            headers={"Referer": "https://www.bilibili.com/"}).json()
+        img_key = nav["data"]["wbi_img"]["img_url"].split('/')[-1].split('.')[0]
+        sub_key = nav["data"]["wbi_img"]["sub_url"].split('/')[-1].split('.')[0]
+        return img_key, sub_key
+
+    def wbi_sign(self,params: dict, img_key: str, sub_key: str):
+        """官方 W-BI 混淆表"""
+        MIXIN_TAB = [46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35,
+                     27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13,
+                     37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4,
+                     22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52]
+        mixin_key = ''.join((img_key + sub_key)[i] for i in MIXIN_TAB)[:32]
+
+        params["wts"] = int(time.time())
+        query = urllib.parse.urlencode(sorted(params.items()))
+        params["w_rid"] = hashlib.md5(f"{query}{mixin_key}".encode()).hexdigest()
+        return params
     async def _init_host_server(self):
         try:
+            img_key, sub_key = self.get_img_sub_key()
+            signed = self.wbi_sign(
+                {"id": self._room_id, "type": 0, "web_location": "444.8"},
+                img_key, sub_key)
             async with self._session.get(
                 DANMAKU_SERVER_CONF_URL,
                 headers={'User-Agent': utils.USER_AGENT},
-                params={
-                    'id': self._room_id,
-                    'type': 0
-                },
+                params=signed,
             ) as res:
                 if res.status != 200:
                     logger.warning('room=%d _init_host_server() failed, status=%d, reason=%s', self._room_id,

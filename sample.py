@@ -2,13 +2,15 @@
 import asyncio
 import http.cookies
 import random
-from datetime import datetime
+from dataclasses import asdict
+from datetime import datetime, timedelta, timezone
 
 import requests
 
 from typing import *
 
 import aiohttp
+import yarl
 
 import blivedm
 import blivedm.models.web as web_models
@@ -19,16 +21,22 @@ TEST_ROOM_IDS = [
 ]
 
 # 这里填一个已登录账号的cookie的SESSDATA字段的值。不填也可以连接，但是收到弹幕的用户名会打码，UID会变成0
-SESSDATA = '08c12224%2C1749526310%2C8d778%2Ac2CjAtTPswAtRoKo_E8L5oIdnZ9Lwl_pYqei91QBA7Ezi2clNqC0AnptOZ4kNPXqL9ZvUSVnF1SGk0VkFUN2o5bG1rUTN1eHJrVjRjTGdDMnZGWUZERTZKMUVFRE44NjAtb1AtSnNySjlPVkJITUlRSWVpblh1WXdPMV8tZ1R5VE1BdHF1U1RRQ1ZRIIEC'
+
+
+SESSDATA= '62203e3b%2C1786353200%2Ceb162%2A22CjCJI8wYJNRajvvI-0KqRstjv_fWoMUyx0B7-kXnU_J4J9-Tn-D83ZsSBuqIl5YsZr4SVlpwd3BmS1B4ZEU5YVdvYUQtOVZQZU1oX3hTSUU3Z0toZnFvQTVRb21RcDAtX3BxcFNkQjJwZXd2UWJCRFYyUDNPdzRFU2huLW5PZXdHOVdEMVJMYm13IIEC'
+bili_jct= '9dc53ae081a153f9b6ccf1afcf32cbb1'
+DedeUserID= '154107998'
+    # optional: add more if needed
 
 session: Optional[aiohttp.ClientSession] = None
 # Initialize Firebase
 
 FIREBASE_DB_URL = "https://tuzigiftdb-default-rtdb.firebaseio.com/"  # Replace with your database URL
 AUTH_TOKEN = ""  # Optional: Add Firebase authentication token if required
-
-
+FIREBASE_DB_URL2 = "https://bilibilidata-default-rtdb.firebaseio.com/"
+databridge="https://jsondatabridge.azurewebsites.net/Forward/Post"
 async def main():
+
     init_session()
     try:
         #await run_single_client()
@@ -36,10 +44,20 @@ async def main():
     finally:
         await session.close()
 
+async def create_session_with_cookies() -> aiohttp.ClientSession:
+    cookie_jar = aiohttp.CookieJar()
+    cookie_jar.update_cookies({
+        'SESSDATA': SESSDATA,
+        'bili_jct': bili_jct,
+        'DedeUserID': DedeUserID
+    }, response_url=yarl.URL('https://bilibili.com'))
 
+    return aiohttp.ClientSession(cookie_jar=cookie_jar)
 def init_session():
     cookies = http.cookies.SimpleCookie()
     cookies['SESSDATA'] = SESSDATA
+    cookies['bili_jct'] = bili_jct
+    cookies['DedeUserID'] = DedeUserID
     cookies['SESSDATA']['domain'] = 'bilibili.com'
 
     global session
@@ -52,7 +70,9 @@ async def run_single_client():
     演示监听一个直播间
     """
     room_id = random.choice(TEST_ROOM_IDS)
-    client = blivedm.BLiveClient(room_id, session=session)
+    session1 = await create_session_with_cookies()
+
+    client = blivedm.BLiveClient(room_id, session=session1)
     handler = MyHandler()
     client.set_handler(handler)
 
@@ -88,16 +108,96 @@ async def run_multi_clients():
 
 
 class MyHandler(blivedm.BaseHandler):
+    def __init__(self):
+        super().__init__()
+        self._last_content: str | None = None     # last danmaku text we saw
+        self._repeat_uids: set[int] = set()       # uids that repeated it
+        self._ignore_current_content: bool = False
     def _send_to_firebase(self, path, data):
-        """Send the data to Firebase using REST API."""
         url = f"{FIREBASE_DB_URL}{path}.json"
-        params = {"auth": AUTH_TOKEN} if AUTH_TOKEN else {}
-        response = requests.post(url, params=params, json=data)
+        response = self.forward_to_php(url,data)
+        #response= requests.post(url, json=data)
+
         if response.status_code == 200:
-            print(f"Data sent successfully to {path}")
+            print(f"Data sent successfully to {path}: {response.text}")
+        else:
+            print(f"Failed to send data to {path}: {response.text}")
+    def _send_to_firebase2(self, path, data):
+        url = f"{FIREBASE_DB_URL2}{path}.json"
+        #response= requests.post(url, json=data)
+
+        response = self.forward_to_php(url,data)
+
+        if response.status_code == 200:
+            print(f"Data sent successfully to {path}: {response.text}")
         else:
             print(f"Failed to send data to {path}: {response.text}")
 
+    def forward_to_php(self,firebase_url, data):
+        # The URL of your PHP script
+        php_url = 'http://qiantongzhou.huizhoutech.top/webfunctions/databridge.php'  # Change this to the actual path where your PHP script is hosted
+
+        # Prepare the data to send to PHP script
+        payload = {
+            'FirebaseUrl': firebase_url,
+            'Data': data
+        }
+
+        # Send the POST request to the PHP script
+        response = requests.post(php_url, json=payload)
+
+        # Print the response from the PHP script
+        return response
+    def _on_danmaku(
+        self,
+        client: blivedm.BLiveClient,
+        message: web_models.DanmakuMessage,
+    ):
+        content = message.msg.strip()
+
+        # -- 1. Detect repetition from different users ------------------ #
+        if content == self._last_content:
+            self._repeat_uids.add(message.uid)
+
+            # Once THREE different senders have repeated this text,
+            # we flip the ignore flag.
+            if len(self._repeat_uids) >= 3:
+                self._ignore_current_content = True
+        else:
+            # New text → reset all repetition tracking state
+            self._last_content = content
+            self._repeat_uids = {message.uid}
+            self._ignore_current_content = False
+
+        # -- 2. Ignore this text while we are in “poll spam” mode -------- #
+        if self._ignore_current_content:
+            return
+        if "来至猫爪温馨提醒" in content or "送礼物喊开" in content:
+            print("猫爪 bot not record")
+            return
+
+        # ---------------------------------------------------------------- #
+        # 3. Normal handling (print + Firebase)                            #
+        # ---------------------------------------------------------------- #
+        print(f'[{client.room_id}] {message.uname}: {content}')
+
+        beijing_tz = timezone(timedelta(hours=8))
+        now        = datetime.now(beijing_tz)
+        date_str   = now.strftime("%Y-%m-%d")
+        time_str   = now.strftime("%H-%M-%S")
+
+        data = {
+            "uid"         : message.uid,
+            "timestamp"   : message.timestamp,
+            "uname"       : message.uname,
+            "msg"         : content,
+            "medal_name"  : message.medal_name,
+            "medal_level" : message.medal_level,
+            "admin"       : message.admin,
+            "bubble"      : message.bubble,
+        }
+        path = f"{date_str}/{client.room_id}/user_message/{time_str}/{message.rnd}"
+        self._send_to_firebase2(path, data)
     def _on_gift(self, client: blivedm.BLiveClient, message: web_models.GiftMessage):
         print(f'[{client.room_id}] {message}')
         # Prepare the gift message data as a dictionary
@@ -118,9 +218,15 @@ class MyHandler(blivedm.BaseHandler):
             "total_coin": message.total_coin,
             "tid": message.tid
         }
+        if '人气票' in message.gift_name and message.num ==1:
         # Include the current date in the path
-        date = datetime.now().strftime("%Y-%m-%d")
-        self._send_to_firebase(f"{date}/{client.room_id}/gift_messages/{message.timestamp}", data)
+            print(f'[{client.room_id}] 人气票discard')
+        else:
+            # Beijing timezone (UTC+8)
+            beijing_tz = timezone(timedelta(hours=8))
+            beijing_time = datetime.now(beijing_tz)
+            date_str = beijing_time.strftime("%Y-%m-%d")
+            self._send_to_firebase(f"{date_str}/{client.room_id}/gift_messages/{message.timestamp}", data)
 
     def _on_buy_guard(self, client: blivedm.BLiveClient, message: web_models.GuardBuyMessage):
         print(f'[{client.room_id}] {message}')
@@ -136,8 +242,11 @@ class MyHandler(blivedm.BaseHandler):
             "end_time": message.end_time
         }
         # Include the current date in the path
-        date = datetime.now().strftime("%Y-%m-%d")
-        self._send_to_firebase(f"{date}/{client.room_id}/guard_buy_messages/{message.start_time}", data)
+        # Beijing timezone (UTC+8)
+        beijing_tz = timezone(timedelta(hours=8))
+        beijing_time = datetime.now(beijing_tz)
+        date_str = beijing_time.strftime("%Y-%m-%d")
+        self._send_to_firebase(f"{date_str}/{client.room_id}/guard_buy_messages/{message.start_time}", data)
 
     def _on_super_chat(self, client: blivedm.BLiveClient, message: web_models.SuperChatMessage):
         print(f'[{client.room_id}] {message}')
@@ -163,7 +272,10 @@ class MyHandler(blivedm.BaseHandler):
             "background_price_color": message.background_price_color
         }
         # Include the current date in the path
-        date = datetime.now().strftime("%Y-%m-%d")
-        self._send_to_firebase(f"{date}/{client.room_id}/super_chat_messages/{message.start_time}", data)
+        # Beijing timezone (UTC+8)
+        beijing_tz = timezone(timedelta(hours=8))
+        beijing_time = datetime.now(beijing_tz)
+        date_str = beijing_time.strftime("%Y-%m-%d")
+        self._send_to_firebase(f"{date_str}/{client.room_id}/super_chat_messages/{message.start_time}", data)
 if __name__ == '__main__':
     asyncio.run(main())
